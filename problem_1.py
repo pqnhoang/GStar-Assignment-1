@@ -54,20 +54,31 @@ class FlashAttention2Function(torch.autograd.Function):
                         V_tile = V_bh[k_start:k_end, :]
                         
                         S_ij = (Q_tile @ K_tile.transpose(-1, -2)) * scale
-                        
+
                         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
+                        S_ij = S_ij.float()
                         # 1. Apply causal masking if is_causal is True.
-                        #
+                        if is_causal:
+                            q_idx = torch.arange(q_start, q_end, device=Q.device)
+                            k_idx = torch.arange(k_start, k_end, device=Q.device)
+                            S_ij = S_ij.masked_fill(q_idx[:, None] < k_idx[None, :], float('-inf'))
                         # 2. Compute the new running maximum
-                        #
+                        m_new = torch.maximum(m_i, S_ij.max(dim=-1).values)
+
                         # 3. Rescale the previous accumulators (o_i, l_i)
-                        #
+                        alpha = torch.exp(m_i - m_new)
+                        l_i = alpha * l_i
+                        o_i = alpha.unsqueeze(-1) * o_i
+
                         # 4. Compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new).
-                        #
+                        P_tilde_ij = torch.exp(S_ij - m_new.unsqueeze(-1))
+
                         # 5. Accumulate the current tile's contribution to the accumulators to update l_i and o_i
-                        #
-                        # 6. Update the running max for the next iteration
+                        l_i = l_i + P_tilde_ij.sum(dim=-1)
+                        o_i = o_i + P_tilde_ij @ V_tile.float()
                         
+                        # 6. Update the running max for the next iteration
+                        m_i = m_new
                         # --- END OF STUDENT IMPLEMENTATION ---
 
                     # After iterating through all key tiles, normalize the output
