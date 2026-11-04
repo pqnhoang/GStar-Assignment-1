@@ -55,10 +55,97 @@ def _flash_attention_forward_swa_kernel(
     # Combine all code from previous problems, and add the sink logic.
     # You should have 3 phases:
     # 1. Phase 0: Sink blocks that are before the sliding window
-    # 2. Phase 1: Off-Diagonal Blocks (within the window)
-    # 3. Phase 2: Diagonal Blocks
-    pass
-    # --- END OF STUDENT IMPLEMENTATION ---
+    window_start = tl.maximum(0, q_block_idx * BLOCK_M - WINDOW_SIZE + 1) // BLOCK_N * BLOCK_N
+    sink_end = tl.minimum(tl.cdiv(SINK_SIZE, BLOCK_N) * BLOCK_N, window_start)
+
+    
+    for start_n in range(0, sink_end, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        # Compute attention scores S_ij = Q_i * K_j^T
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        
+        s_ij = tl.where(k_offsets < SINK_SIZE, s_ij, float('-inf'))
+        # Load V_j from the shared K/V head
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # Online softmax update
+        # Online softmax update
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+        acc = acc * alpha[:, None] + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i * alpha + tl.sum(p_ij, axis=1)
+        m_i = m_new
+    
+
+    for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
+        # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
+        # Hint: You might need to apply the per-element sliding window mask to s_ij.
+        #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        # Compute attention scores S_ij = Q_i * K_j^T
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        
+        dist = q_offsets[:, None] - k_offsets[None, :]
+        s_ij = tl.where((dist < WINDOW_SIZE) | (k_offsets[None, :] < SINK_SIZE), s_ij, float('-inf'))
+        # Load V_j from the shared K/V head
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # Online softmax update
+        # Online softmax update
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+        acc = acc * alpha[:, None] + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i * alpha + tl.sum(p_ij, axis=1)
+        m_i = m_new
+
+
+    # --- Phase 2: Diagonal Blocks ---
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        # Compute attention scores S_ij = Q_i * K_j^T
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        dist = q_offsets[:, None] - k_offsets[None, :]
+        s_ij = tl.where((dist >= 0) & ((dist < WINDOW_SIZE) | (k_offsets[None, :] < SINK_SIZE)), s_ij, float('-inf'))
+
+                # Load V_j from the shared K/V head
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # Online softmax update
+        # Online softmax update
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+        acc = acc * alpha[:, None] + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i * alpha + tl.sum(p_ij, axis=1)
+        m_i = m_new
 
     # 4. Normalize and write the final output block.
     l_i_safe = tl.where(l_i == 0, 1.0, l_i)
